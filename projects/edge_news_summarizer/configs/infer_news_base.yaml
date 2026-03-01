@@ -1,0 +1,26 @@
+### Model（基座模型，无 adapter，用于与微调版本对比）
+model_name_or_path: D:/LLM/models/Qwen3-4B
+
+### Method
+stage: sft
+do_predict: true
+finetuning_type: full
+
+### Dataset
+eval_dataset: news_structured_summary_test
+template: qwen3_nothink
+cutoff_len: 1024
+
+### Qwen3 特有
+enable_thinking: false
+
+### Output
+output_dir: projects/edge_news_summarizer/outputs/eval_base
+per_device_eval_batch_size: 4
+predict_with_generate: true
+bf16: true
+
+### Generation
+max_new_tokens: 512
+temperature: 0.1
+top_p: 0.9
