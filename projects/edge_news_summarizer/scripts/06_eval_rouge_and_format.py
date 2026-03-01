@@ -29,7 +29,8 @@ EVAL_DIR = PROJECT_DIR / "outputs" / "eval"
 EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_TEST = PROJECT_DIR / "data" / "cleaned" / "test.json"
-DEFAULT_PREDICTIONS = EVAL_DIR / "generated_predictions.jsonl"
+# LlamaFactory 实际输出路径（相对于 D:\LLM\LlamaFactory 运行）
+DEFAULT_PREDICTIONS = Path("D:/LLM/LlamaFactory/projects/edge_news_summarizer/outputs/eval/generated_predictions.jsonl")
 
 REQUIRED_SECTIONS = [
     "【一句话摘要】",
@@ -53,8 +54,19 @@ def load_test_data(path: Path) -> list[dict]:
     return data if isinstance(data, list) else [data]
 
 
-def load_predictions(path: Path) -> list[str]:
-    """加载模型预测结果（每行一个 JSON 或纯文本）。"""
+def strip_think_block(text: str) -> str:
+    """剥离 Qwen3 思维链块 <think>...</think>，返回实际答案部分。
+    若无 think 块则原样返回。剥离后去掉首尾空白。
+    """
+    # 贪婪匹配整个 think 块（含嵌套情况用非贪婪）
+    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return stripped.strip()
+
+
+def load_predictions(path: Path, strip_think: bool = False) -> list[str]:
+    """加载模型预测结果（每行一个 JSON 或纯文本）。
+    strip_think=True 时自动剥离 <think>...</think> 块（用于基座模型评测）。
+    """
     predictions = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -65,9 +77,12 @@ def load_predictions(path: Path) -> list[str]:
                 obj = json.loads(line)
                 # LLaMA-Factory 输出格式：{"predict": "...", "label": "..."}
                 pred = obj.get("predict", obj.get("generated_text", obj.get("output", line)))
+                if strip_think:
+                    pred = strip_think_block(pred)
                 predictions.append(pred)
             except json.JSONDecodeError:
-                predictions.append(line)
+                pred = strip_think_block(line) if strip_think else line
+                predictions.append(pred)
     return predictions
 
 
@@ -194,6 +209,8 @@ def main():
                         help="模型推理结果路径")
     parser.add_argument("--output_dir", type=str, default=str(EVAL_DIR))
     parser.add_argument("--no_jieba", action="store_true", help="禁用 jieba 分词")
+    parser.add_argument("--strip_think", action="store_true",
+                        help="评测前剥离 <think>...</think> 块（基座模型推理结果使用）")
     args = parser.parse_args()
 
     test_path = Path(args.test)
@@ -210,7 +227,7 @@ def main():
         sys.exit(1)
 
     test_data = load_test_data(test_path)
-    predictions = load_predictions(pred_path)
+    predictions = load_predictions(pred_path, strip_think=args.strip_think)
     references = [r.get("output", "") for r in test_data]
 
     n = min(len(references), len(predictions))

@@ -8,11 +8,13 @@ finetuning_type: full
 
 ### Dataset
 eval_dataset: news_structured_summary_test
-template: qwen3_nothink
-cutoff_len: 1024
+# 使用 qwen3（ReasoningTemplate）：正确处理 <think></think> 分隔符
+# 基座模型会自发生成 think 块，qwen3_nothink 无法抑制且会导致 </think> 无法被识别
+template: qwen3
+cutoff_len: 4096
 
 ### Qwen3 特有
-enable_thinking: false
+enable_thinking: true
 
 ### Output
 output_dir: projects/edge_news_summarizer/outputs/eval_base
@@ -21,6 +23,9 @@ predict_with_generate: true
 bf16: true
 
 ### Generation
-max_new_tokens: 512
+# 2048 = think 块（~1500 token）+ 结构化答案（~400 token），覆盖 P95
+max_new_tokens: 2048
 temperature: 0.1
 top_p: 0.9
+# 防止重复循环（基座模型在耗尽 token 前易陷入重复）
+repetition_penalty: 1.1
