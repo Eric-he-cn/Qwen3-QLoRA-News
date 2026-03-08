@@ -27,6 +27,7 @@ SYSTEM_PROMPT = "你是一位专业的新闻编辑助手，请对新闻进行结
 
 
 def load_test_samples(path: Path, num_samples: int) -> list[dict]:
+    """加载测试样本，返回指定数量的前缀切片。"""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, list):
@@ -35,6 +36,7 @@ def load_test_samples(path: Path, num_samples: int) -> list[dict]:
 
 
 def build_prompt(record: dict) -> str:
+    """从样本中提取输入字段作为用户 prompt。"""
     return record.get("input", "")
 
 
@@ -135,7 +137,6 @@ def run_benchmark(model_path: str, adapter_path: str | None, test_samples: list[
         sys.exit(1)
 
     latencies_sorted = sorted(latencies)
-    n = len(latencies_sorted)
 
     def percentile(sorted_data, p):
         idx = int(len(sorted_data) * p / 100)
@@ -170,6 +171,7 @@ def run_benchmark(model_path: str, adapter_path: str | None, test_samples: list[
 
 
 def main():
+    """脚本入口。"""
     parser = argparse.ArgumentParser(description="推理延迟评测脚本")
     parser.add_argument("--model_path", type=str, required=True,
                         help="模型路径（基座模型或已合并权重）")

@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
 06_eval_rouge_and_format.py
-对模型推理结果进行 ROUGE 评测和格式正确率评测。
 
-输入：
-  - 测试集：data/cleaned/test.json（含 reference output）
-  - 模型推理结果：outputs/eval/generated_predictions.jsonl（LLaMA-Factory 推理输出）
+本脚本负责两类评测任务：
+1) 离线评测（eval）：对已有预测文件计算 ROUGE 与格式合规率。
+2) 在线基准（benchmark）：直接加载模型推理并完成 A/B/C 三组对比。
 
-输出：
-  - outputs/eval/rouge_report.json
-  - outputs/eval/format_report.json
-  - outputs/eval/bad_cases.jsonl（格式失败的样本）
+A/B/C 组定义（默认）：
+- A：Base 不思考（enable_thinking=False）
+- B：Base 思考（enable_thinking=True）
+- C：SFT V2 不思考（优先使用合并模型；若未提供合并模型则自动 merge LoRA）
 
-用法：
-  python scripts/06_eval_rouge_and_format.py
-  python scripts/06_eval_rouge_and_format.py --predictions outputs/eval/generated_predictions.jsonl
+关键约束：
+- Base 组始终使用“纯基座权重”直接推理，不通过 PeftModel 包装后再禁用适配器。
+- 断点续跑：每条样本立即写入 checkpoint（JSONL），中断后可自动续跑。
+- Thinking 组允许 batch>1（建议不超过 2），以便在显存允许时提升吞吐。
 """
 
 import argparse
+import gc
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -29,8 +31,11 @@ EVAL_DIR = PROJECT_DIR / "outputs" / "eval"
 EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_TEST = PROJECT_DIR / "data" / "cleaned" / "test.json"
-# LlamaFactory 实际输出路径（相对于 D:\LLM\LlamaFactory 运行）
-DEFAULT_PREDICTIONS = Path("D:/LLM/LlamaFactory/projects/edge_news_summarizer/outputs/eval/generated_predictions.jsonl")
+DEFAULT_PREDICTIONS = Path(
+    "D:/LLM/LlamaFactory/projects/edge_news_summarizer/outputs/eval/generated_predictions.jsonl"
+)
+DEFAULT_BASE_MODEL = "D:/LLM/models/Qwen3-4B"
+DEFAULT_ADAPTER_PATH = str(PROJECT_DIR / "outputs" / "checkpoints" / "qwen3-4b-qlora-news-v2")
 
 REQUIRED_SECTIONS = [
     "【一句话摘要】",
@@ -42,32 +47,36 @@ REQUIRED_SECTIONS = [
 ]
 
 VALID_CATEGORIES = {
-    "科技", "财经", "政治", "社会", "体育", "文化", "国际", "军事", "环境", "健康",
+    "政治", "经济", "科技", "文化", "社会", "军事", "体育", "健康", "环境", "国际", "历史", "旅游", "财经",
     "technology", "finance", "politics", "society", "sports", "culture",
     "international", "military", "environment", "health",
 }
 
+MEDIUM_SYSTEM_PROMPT = (
+    "你是专业的新闻编辑助手。请对新闻内容进行结构化摘要，严格按以下6个标签顺序输出，禁止使用 Markdown：\n"
+    "【一句话摘要】【核心要点】【事件类别】【主要主体】【时间信息】【潜在影响】\n\n"
+    "其中【核心要点】用阿拉伯数字编号列出至少3条；\n"
+    "【事件类别】只能从以下选择：政治、经济、科技、文化、社会、军事、体育、健康、环境、国际、历史、旅游、财经"
+)
+
+MAX_TOKENS = {"A": 800, "B": 3072, "C": 800}
+
 
 def load_test_data(path: Path) -> list[dict]:
+    """加载测试数据，统一返回 list[dict]。"""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return data if isinstance(data, list) else [data]
 
 
 def strip_think_block(text: str) -> str:
-    """剥离 Qwen3 思维链块 <think>...</think>，返回实际答案部分。
-    若无 think 块则原样返回。剥离后去掉首尾空白。
-    """
-    # 贪婪匹配整个 think 块（含嵌套情况用非贪婪）
-    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    return stripped.strip()
+    """移除 <think>...</think> 思维链块并返回清洗后的正文。"""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 def load_predictions(path: Path, strip_think: bool = False) -> list[str]:
-    """加载模型预测结果（每行一个 JSON 或纯文本）。
-    strip_think=True 时自动剥离 <think>...</think> 块（用于基座模型评测）。
-    """
-    predictions = []
+    """加载预测文件（JSONL 或纯文本），可选剥离 think 块。"""
+    predictions: list[str] = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -75,105 +84,85 @@ def load_predictions(path: Path, strip_think: bool = False) -> list[str]:
                 continue
             try:
                 obj = json.loads(line)
-                # LLaMA-Factory 输出格式：{"predict": "...", "label": "..."}
                 pred = obj.get("predict", obj.get("generated_text", obj.get("output", line)))
-                if strip_think:
-                    pred = strip_think_block(pred)
-                predictions.append(pred)
             except json.JSONDecodeError:
-                pred = strip_think_block(line) if strip_think else line
-                predictions.append(pred)
+                pred = line
+            predictions.append(strip_think_block(pred) if strip_think else pred)
     return predictions
 
 
-def compute_rouge(references: list[str], predictions: list[str],
-                  use_jieba: bool = True) -> dict:
-    """计算 ROUGE 分数。"""
+def compute_rouge(references: list[str], predictions: list[str], use_jieba: bool = True) -> dict:
+    """计算 ROUGE-1/2/L（中文优先 jieba 分词，失败则回退字符级）。"""
     try:
         from rouge_score import rouge_scorer
     except ImportError:
         print("[ERROR] 请先安装 rouge-score: pip install rouge-score", file=sys.stderr)
         sys.exit(1)
 
+    metrics = ["rouge1", "rouge2", "rougeL"]
+
     if use_jieba:
         try:
             import jieba
 
-            def tokenize_zh(text):
-                return " ".join(jieba.cut(text))
-
-            scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"],
-                                              use_stemmer=False,
-                                              tokenizer=None)
-            scores = {"rouge1": [], "rouge2": [], "rougeL": []}
+            scorer = rouge_scorer.RougeScorer(metrics, use_stemmer=False, tokenizer=None)
+            scores = {m: [] for m in metrics}
             for ref, pred in zip(references, predictions):
-                ref_tok = tokenize_zh(ref)
-                pred_tok = tokenize_zh(pred)
+                ref_tok = " ".join(jieba.cut(ref))
+                pred_tok = " ".join(jieba.cut(pred))
                 result = scorer.score(ref_tok, pred_tok)
-                for k in scores:
-                    scores[k].append(result[k].fmeasure)
+                for m in metrics:
+                    scores[m].append(result[m].fmeasure)
+            return {k: sum(v) / len(v) if v else 0.0 for k, v in scores.items()}
         except ImportError:
-            print("[WARN] jieba 未安装，使用字符级 ROUGE（适合中文）")
-            use_jieba = False
+            print("[WARN] jieba 未安装，回退到字符级 ROUGE")
 
-    if not use_jieba:
-        scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=False)
-        scores = {"rouge1": [], "rouge2": [], "rougeL": []}
-        for ref, pred in zip(references, predictions):
-            # 字符分割（中文友好）
-            ref_chars = " ".join(list(ref))
-            pred_chars = " ".join(list(pred))
-            result = scorer.score(ref_chars, pred_chars)
-            for k in scores:
-                scores[k].append(result[k].fmeasure)
-
+    scorer = rouge_scorer.RougeScorer(metrics, use_stemmer=False)
+    scores = {m: [] for m in metrics}
+    for ref, pred in zip(references, predictions):
+        result = scorer.score(" ".join(list(ref)), " ".join(list(pred)))
+        for m in metrics:
+            scores[m].append(result[m].fmeasure)
     return {k: sum(v) / len(v) if v else 0.0 for k, v in scores.items()}
 
 
 def check_format(text: str) -> dict:
-    """检查单条预测的格式合规性。"""
-    results = {}
+    """检查单条输出的结构字段、类别、要点数量与时间字段。"""
+    result: dict[str, object] = {}
 
-    # 1. 必需字段
     for section in REQUIRED_SECTIONS:
-        results[f"has_{section}"] = section in text
-    results["all_sections_present"] = all(results[f"has_{s}"] for s in REQUIRED_SECTIONS)
+        result[f"has_{section}"] = section in text
+    result["all_sections_present"] = all(result[f"has_{section}"] for section in REQUIRED_SECTIONS)
 
-    # 2. 类别合规
     cat_match = re.search(r"【事件类别】\s*\n?\s*([^\n【]+)", text)
     if cat_match:
-        cat = cat_match.group(1).strip().lower()
-        results["valid_category"] = any(v.lower() in cat or cat in v.lower()
-                                        for v in VALID_CATEGORIES)
-        results["extracted_category"] = cat_match.group(1).strip()
+        category = cat_match.group(1).strip().lower()
+        result["valid_category"] = any(v.lower() in category or category in v.lower() for v in VALID_CATEGORIES)
+        result["extracted_category"] = cat_match.group(1).strip()
     else:
-        results["valid_category"] = False
-        results["extracted_category"] = ""
+        result["valid_category"] = False
+        result["extracted_category"] = ""
 
-    # 3. 要点格式
-    bullet_section = re.search(r"【核心要点】(.*?)(?:【|$)", text, re.DOTALL)
-    if bullet_section:
-        bullets = re.findall(r"^\s*\d+[\.、．]\s*.+", bullet_section.group(1), re.MULTILINE)
-        results["bullet_count"] = len(bullets)
-        results["valid_bullets"] = len(bullets) >= 3
+    bullet_match = re.search(r"【核心要点】(.*?)(?:【|$)", text, re.DOTALL)
+    if bullet_match:
+        bullets = re.findall(r"^\s*\d+[\.、．]\s*.+", bullet_match.group(1), re.MULTILINE)
+        result["bullet_count"] = len(bullets)
+        result["valid_bullets"] = len(bullets) >= 3
     else:
-        results["bullet_count"] = 0
-        results["valid_bullets"] = False
+        result["bullet_count"] = 0
+        result["valid_bullets"] = False
 
-    # 4. 时间信息存在
-    time_match = re.search(r"【时间信息】\s*\n?\s*([^\n【]+)", text)
-    results["has_time_info"] = bool(time_match)
-
-    return results
+    result["has_time_info"] = bool(re.search(r"【时间信息】\s*\n?\s*([^\n【]+)", text))
+    return result
 
 
 def evaluate_format(predictions: list[str]) -> tuple[dict, list[int]]:
-    """批量格式评测。"""
-    all_results = [check_format(p) for p in predictions]
-    bad_case_indices = []
+    """批量评测格式合规率并返回 bad case 索引。"""
+    rows = [check_format(pred) for pred in predictions]
+    n = len(rows)
 
-    aggregated = {
-        "total": len(predictions),
+    report = {
+        "total": n,
         "all_sections_pass_rate": 0.0,
         "valid_category_rate": 0.0,
         "valid_bullets_rate": 0.0,
@@ -182,53 +171,407 @@ def evaluate_format(predictions: list[str]) -> tuple[dict, list[int]]:
         "missing_field_rate": 0.0,
         "invalid_category_rate": 0.0,
     }
+    if n == 0:
+        return report, []
 
-    if not all_results:
-        return aggregated, bad_case_indices
+    report["all_sections_pass_rate"] = sum(bool(r["all_sections_present"]) for r in rows) / n
+    report["valid_category_rate"] = sum(bool(r["valid_category"]) for r in rows) / n
+    report["valid_bullets_rate"] = sum(bool(r["valid_bullets"]) for r in rows) / n
+    report["has_time_info_rate"] = sum(bool(r["has_time_info"]) for r in rows) / n
+    report["avg_bullet_count"] = sum(int(r["bullet_count"]) for r in rows) / n
+    report["missing_field_rate"] = 1.0 - report["all_sections_pass_rate"]
+    report["invalid_category_rate"] = 1.0 - report["valid_category_rate"]
 
-    n = len(all_results)
-    aggregated["all_sections_pass_rate"] = sum(r["all_sections_present"] for r in all_results) / n
-    aggregated["valid_category_rate"] = sum(r["valid_category"] for r in all_results) / n
-    aggregated["valid_bullets_rate"] = sum(r["valid_bullets"] for r in all_results) / n
-    aggregated["has_time_info_rate"] = sum(r["has_time_info"] for r in all_results) / n
-    aggregated["avg_bullet_count"] = sum(r["bullet_count"] for r in all_results) / n
-    aggregated["missing_field_rate"] = 1.0 - aggregated["all_sections_pass_rate"]
-    aggregated["invalid_category_rate"] = 1.0 - aggregated["valid_category_rate"]
-
-    bad_case_indices = [i for i, r in enumerate(all_results)
-                        if not r["all_sections_present"] or not r["valid_category"]]
-
-    return aggregated, bad_case_indices
+    bad_indices = [
+        i for i, row in enumerate(rows)
+        if (not bool(row["all_sections_present"])) or (not bool(row["valid_category"]))
+    ]
+    return report, bad_indices
 
 
-def main():
-    parser = argparse.ArgumentParser(description="ROUGE + 格式评测脚本")
-    parser.add_argument("--test", type=str, default=str(DEFAULT_TEST),
-                        help="测试集路径（含 reference output）")
-    parser.add_argument("--predictions", type=str, default=str(DEFAULT_PREDICTIONS),
-                        help="模型推理结果路径")
-    parser.add_argument("--output_dir", type=str, default=str(EVAL_DIR))
-    parser.add_argument("--no_jieba", action="store_true", help="禁用 jieba 分词")
-    parser.add_argument("--strip_think", action="store_true",
-                        help="评测前剥离 <think>...</think> 块（基座模型推理结果使用）")
-    args = parser.parse_args()
+def _clear_torch_cache() -> None:
+    """释放 Python 与 CUDA 缓存，降低切换模型时的显存峰值。"""
+    try:
+        import torch
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _load_tokenizer(model_path: str):
+    """加载 tokenizer，并统一设置左填充与 pad_token。"""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    return tokenizer
+
+
+def _load_base_model(base_model_path: str):
+    """加载纯基座模型（不注入 LoRA）。"""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    print(f"[Benchmark] 加载 Base 模型: {base_model_path}")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+    return model
+
+
+def _load_sft_model(base_model_path: str, adapter_path: str, merged_model_path: str | None):
+    """加载 SFT 模型。
+
+    优先策略：
+    - 若提供 merged_model_path：直接加载合并后完整权重。
+    - 否则：加载 base + adapter，并执行 merge_and_unload 后返回纯权重模型。
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    if merged_model_path:
+        print(f"[Benchmark] 加载已合并 SFT 模型: {merged_model_path}")
+        model = AutoModelForCausalLM.from_pretrained(
+            merged_model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+        return model
+
+    if not adapter_path:
+        raise ValueError("未提供 adapter_path，无法加载未合并 SFT 模型。")
+
+    print(f"[Benchmark] 加载 Base + LoRA 并执行 merge: {adapter_path}")
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    try:
+        from peft import PeftModel
+    except ImportError:
+        print("[ERROR] 缺少 peft，请安装: pip install peft", file=sys.stderr)
+        sys.exit(1)
+
+    peft_model = PeftModel.from_pretrained(base, adapter_path)
+    merged = peft_model.merge_and_unload()
+    merged.eval()
+    return merged
+
+
+def _infer_group(
+    model,
+    tokenizer,
+    samples: list[dict],
+    enable_thinking: bool,
+    max_new_tokens: int,
+    group_label: str,
+    checkpoint_path: Path,
+    batch_size: int,
+) -> tuple[list[str], float]:
+    """执行单组推理，支持断点续跑与批量生成。"""
+    import torch
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+
+    n = len(samples)
+    preds: list[str | None] = [None] * n
+    start_idx = 0
+
+    if checkpoint_path.exists():
+        with open(checkpoint_path, encoding="utf-8") as f:
+            done = [json.loads(line) for line in f if line.strip()]
+        if done:
+            for row in done:
+                idx = int(row["index"])
+                if 0 <= idx < n:
+                    preds[idx] = row["raw"]
+            start_idx = max(int(row["index"]) for row in done) + 1
+            print(f"  [{group_label}] 检测到 checkpoint，从第 {start_idx} 条继续...", flush=True)
+
+    remaining = list(range(start_idx, n))
+    if not remaining:
+        elapsed = 0.0
+        print(f"  [{group_label}] checkpoint 已覆盖全部样本，跳过推理。", flush=True)
+        return [p if p is not None else "" for p in preds], elapsed
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_f = open(checkpoint_path, "a", encoding="utf-8")
+
+    t0 = time.time()
+    pbar = None
+    if tqdm is not None:
+        pbar = tqdm(
+            total=n,
+            initial=start_idx,
+            desc=f"Group {group_label}",
+            unit="条",
+            dynamic_ncols=True,
+            file=sys.stdout,
+        )
+
+    for pos in range(0, len(remaining), batch_size):
+        batch_indices = remaining[pos: pos + batch_size]
+
+        prompts = []
+        for idx in batch_indices:
+            messages = [
+                {"role": "system", "content": MEDIUM_SYSTEM_PROMPT},
+                {"role": "user", "content": samples[idx]["input"]},
+            ]
+            prompts.append(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            )
+
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+        padded_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=0.1,
+                repetition_penalty=1.1,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        for b_idx, sample_idx in enumerate(batch_indices):
+            new_ids = output_ids[b_idx][padded_len:]
+            pred = tokenizer.decode(new_ids, skip_special_tokens=True)
+            preds[sample_idx] = pred
+            ckpt_f.write(json.dumps({"index": sample_idx, "raw": pred}, ensure_ascii=False) + "\n")
+            ckpt_f.flush()
+
+        if pbar is not None:
+            pbar.update(len(batch_indices))
+        else:
+            elapsed_now = time.time() - t0
+            print(f"  [{group_label}] {batch_indices[-1] + 1}/{n} 完成  {elapsed_now:.0f}s elapsed", flush=True)
+
+    if pbar is not None:
+        pbar.close()
+    ckpt_f.close()
+
+    elapsed = time.time() - t0
+    done_count = max(len(remaining), 1)
+    print(
+        f"  [{group_label}] 全部 {n} 条完成，总耗时 {elapsed:.1f}s ({elapsed / done_count:.1f}s/条, batch={batch_size})",
+        flush=True,
+    )
+    return [p if p is not None else "" for p in preds], elapsed
+
+
+def _eval_group(
+    group_label: str,
+    preds_raw: list[str],
+    refs: list[str],
+    test_data: list[dict],
+    output_dir: Path,
+    elapsed: float,
+) -> dict:
+    """评测单组结果并持久化为 group 目录下的报告文件。"""
+    clean_preds = [strip_think_block(p) for p in preds_raw]
+    rouge = compute_rouge(refs, clean_preds)
+    fmt_report, bad_indices = evaluate_format(clean_preds)
+
+    group_dir = output_dir / f"group_{group_label}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(group_dir / "predictions_raw.jsonl", "w", encoding="utf-8") as f:
+        for sample, raw, clean in zip(test_data, preds_raw, clean_preds):
+            f.write(
+                json.dumps(
+                    {
+                        "input": sample.get("input", ""),
+                        "reference": sample.get("output", ""),
+                        "raw": raw,
+                        "clean": clean,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    (group_dir / "rouge_report.json").write_text(json.dumps(rouge, ensure_ascii=False, indent=2), encoding="utf-8")
+    (group_dir / "format_report.json").write_text(
+        json.dumps(fmt_report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    with open(group_dir / "bad_cases.jsonl", "w", encoding="utf-8") as f:
+        for idx in bad_indices:
+            f.write(json.dumps({"index": idx, "clean": clean_preds[idx]}, ensure_ascii=False) + "\n")
+
+    summary = {
+        "group": group_label,
+        "n_samples": len(preds_raw),
+        "elapsed_s": round(elapsed, 1),
+        "per_sample_s": round(elapsed / max(len(preds_raw), 1), 1),
+        "rouge1": round(rouge["rouge1"], 4),
+        "rouge2": round(rouge["rouge2"], 4),
+        "rougeL": round(rouge["rougeL"], 4),
+        "all_sections_pass": f"{fmt_report['all_sections_pass_rate']:.1%}",
+        "valid_category": f"{fmt_report['valid_category_rate']:.1%}",
+        "valid_bullets": f"{fmt_report['valid_bullets_rate']:.1%}",
+        "bad_cases": len(bad_indices),
+    }
+
+    print(f"\n  示例输出（Group {group_label} 第1条）：")
+    print("  " + "-" * 50)
+    if clean_preds:
+        print("  " + clean_preds[0].replace("\n", "\n  ")[:400])
+    else:
+        print("  (空)")
+    print("  " + "-" * 50)
+    return summary
+
+
+def run_benchmark(
+    base_model_path: str,
+    adapter_path: str,
+    test_data: list[dict],
+    output_dir: Path,
+    batch_size: int = 1,
+    skip_think: bool = False,
+    merged_model_path: str | None = None,
+    only_groups: str | None = None,
+) -> None:
+    """运行 A/B/C 在线推理对比并输出汇总报告。"""
+    refs = [row.get("output", "") for row in test_data]
+    n = len(test_data)
+
+    groups = [
+        ("A", "base", False, MAX_TOKENS["A"], "Base 不思考"),
+        ("B", "base", True, MAX_TOKENS["B"], "Base 思考"),
+        ("C", "sft", False, MAX_TOKENS["C"], "SFT V2 不思考"),
+    ]
+
+    if skip_think:
+        groups = [g for g in groups if g[0] != "B"]
+        print("[Benchmark] 已跳过 Group B（Base 思考模式）", flush=True)
+
+    if only_groups:
+        allow = [x.strip() for x in only_groups.split(",") if x.strip()]
+        groups = [g for g in groups if g[0] in allow]
+        print(f"[Benchmark] 仅运行指定组别: {allow}", flush=True)
+
+    if not groups:
+        print("[ERROR] 无有效组别可运行。", file=sys.stderr)
+        sys.exit(1)
+
+    need_sft = any(g[1] == "sft" for g in groups)
+    if need_sft and not merged_model_path and not adapter_path:
+        print("[ERROR] Group C 需要 --merged_model 或 --adapter_path", file=sys.stderr)
+        sys.exit(1)
+
+    tokenizer_model_path = merged_model_path if (len(groups) == 1 and groups[0][0] == "C" and merged_model_path) else base_model_path
+    print(f"[Benchmark] 加载 tokenizer: {tokenizer_model_path}")
+    tokenizer = _load_tokenizer(tokenizer_model_path)
+
+    current_kind: str | None = None
+    current_model = None
+    all_summaries: list[dict] = []
+
+    for label, model_kind, think, max_tok, desc in groups:
+        eff_batch = batch_size
+        if think and batch_size > 2:
+            print(f"[WARN] Group {label} 为 thinking 模式，建议 batch_size<=2，当前为 {batch_size}")
+
+        if current_kind != model_kind or current_model is None:
+            if current_model is not None:
+                del current_model
+                _clear_torch_cache()
+            if model_kind == "base":
+                current_model = _load_base_model(base_model_path)
+            else:
+                current_model = _load_sft_model(base_model_path, adapter_path, merged_model_path)
+            current_kind = model_kind
+
+        group_dir = output_dir / f"group_{label}"
+        group_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = group_dir / "infer_checkpoint.jsonl"
+
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"  Group {label}：{desc}  (max_new_tokens={max_tok}, batch={eff_batch}, n={n})", flush=True)
+        print(f"  model_kind={model_kind}", flush=True)
+        print(f"  checkpoint => {ckpt_path}", flush=True)
+        print(f"{'=' * 60}", flush=True)
+
+        preds_raw, elapsed = _infer_group(
+            model=current_model,
+            tokenizer=tokenizer,
+            samples=test_data,
+            enable_thinking=think,
+            max_new_tokens=max_tok,
+            group_label=label,
+            checkpoint_path=ckpt_path,
+            batch_size=eff_batch,
+        )
+
+        summary = _eval_group(label, preds_raw, refs, test_data, output_dir, elapsed)
+        all_summaries.append(summary)
+
+    if current_model is not None:
+        del current_model
+    _clear_torch_cache()
+
+    print("\n" + "=" * 72)
+    print("  三组对比结果汇总")
+    print("=" * 72)
+    print(f"{'组别':<6} {'描述':<14} {'R-1':>6} {'R-2':>6} {'R-L':>6} {'全节':>7} {'类别':>7} {'要点':>7} {'坏例':>5} {'耗时/条':>8}")
+    print("-" * 72)
+
+    desc_map = {"A": "Base不思考", "B": "Base思考", "C": "SFT-V2不思考"}
+    for row in all_summaries:
+        print(
+            f"  {row['group']:<4} {desc_map[row['group']]:<14} "
+            f"{row['rouge1']:>6.4f} {row['rouge2']:>6.4f} {row['rougeL']:>6.4f} "
+            f"{row['all_sections_pass']:>7} {row['valid_category']:>7} {row['valid_bullets']:>7} "
+            f"{row['bad_cases']:>5} {row['per_sample_s']:>7.1f}s"
+        )
+    print("=" * 72)
+
+    summary_path = output_dir / "benchmark_summary.json"
+    summary_path.write_text(json.dumps(all_summaries, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[完成] 汇总结果已保存: {summary_path}")
+
+
+def run_eval_mode(args) -> None:
+    """执行离线评测分支（已有预测文件）。"""
     test_path = Path(args.test)
     pred_path = Path(args.predictions)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if not test_path.exists():
         print(f"[ERROR] 测试集不存在: {test_path}", file=sys.stderr)
         sys.exit(1)
     if not pred_path.exists():
         print(f"[ERROR] 预测结果不存在: {pred_path}", file=sys.stderr)
-        print("请先运行模型推理，或使用 --predictions 指定结果文件。", file=sys.stderr)
         sys.exit(1)
 
     test_data = load_test_data(test_path)
     predictions = load_predictions(pred_path, strip_think=args.strip_think)
-    references = [r.get("output", "") for r in test_data]
+    references = [row.get("output", "") for row in test_data]
 
     n = min(len(references), len(predictions))
     if len(references) != len(predictions):
@@ -238,44 +581,90 @@ def main():
 
     print(f"[INFO] 评测 {n} 条样本...")
 
-    # ROUGE 评测
-    print("[INFO] 计算 ROUGE 分数...")
     rouge_scores = compute_rouge(references, predictions, use_jieba=not args.no_jieba)
-    print(f"[INFO] ROUGE-1: {rouge_scores['rouge1']:.4f}")
-    print(f"[INFO] ROUGE-2: {rouge_scores['rouge2']:.4f}")
-    print(f"[INFO] ROUGE-L: {rouge_scores['rougeL']:.4f}")
+    format_report, bad_indices = evaluate_format(predictions)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     rouge_path = output_dir / "rouge_report.json"
     rouge_path.write_text(json.dumps(rouge_scores, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[INFO] ROUGE 报告已保存: {rouge_path}")
-
-    # 格式评测
-    print("[INFO] 评测格式合规性...")
-    format_report, bad_indices = evaluate_format(predictions)
-    print(f"[INFO] 格式通过率: {format_report['all_sections_pass_rate']:.2%}")
-    print(f"[INFO] 类别合规率: {format_report['valid_category_rate']:.2%}")
-    print(f"[INFO] 要点格式率: {format_report['valid_bullets_rate']:.2%}")
-    print(f"[INFO] Bad cases 数量: {len(bad_indices)}")
 
     format_path = output_dir / "format_report.json"
     format_path.write_text(json.dumps(format_report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[INFO] 格式报告已保存: {format_path}")
 
-    # Bad cases
-    bad_cases_path = output_dir / "bad_cases.jsonl"
-    with open(bad_cases_path, "w", encoding="utf-8") as f:
+    with open(output_dir / "bad_cases.jsonl", "w", encoding="utf-8") as f:
         for i in bad_indices:
-            bad = {
-                "index": i,
-                "reference": references[i],
-                "prediction": predictions[i],
-                "input": test_data[i].get("input", ""),
-            }
-            f.write(json.dumps(bad, ensure_ascii=False) + "\n")
-    print(f"[INFO] Bad cases 已保存: {bad_cases_path} ({len(bad_indices)} 条)")
+            f.write(
+                json.dumps(
+                    {
+                        "index": i,
+                        "reference": references[i],
+                        "prediction": predictions[i],
+                        "input": test_data[i].get("input", ""),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
-    print("\n===== 评测完成 =====")
-    print(json.dumps({**rouge_scores, **format_report}, ensure_ascii=False, indent=2))
+    print(f"[INFO] ROUGE-1: {rouge_scores['rouge1']:.4f}")
+    print(f"[INFO] ROUGE-2: {rouge_scores['rouge2']:.4f}")
+    print(f"[INFO] ROUGE-L: {rouge_scores['rougeL']:.4f}")
+    print(f"[INFO] 格式通过率: {format_report['all_sections_pass_rate']:.2%}")
+    print(f"[INFO] 类别合规率: {format_report['valid_category_rate']:.2%}")
+    print(f"[INFO] 要点格式率: {format_report['valid_bullets_rate']:.2%}")
+    print(f"[INFO] Bad cases: {len(bad_indices)}")
+    print(f"[INFO] 报告输出目录: {output_dir}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。"""
+    parser = argparse.ArgumentParser(description="ROUGE + 格式评测脚本")
+    parser.add_argument("--mode", type=str, default="eval", choices=["eval", "benchmark"], help="运行模式")
+    parser.add_argument("--test", type=str, default=str(DEFAULT_TEST), help="测试集路径")
+    parser.add_argument("--predictions", type=str, default=str(DEFAULT_PREDICTIONS), help="离线预测文件路径")
+    parser.add_argument("--output_dir", type=str, default=str(EVAL_DIR), help="评测输出目录")
+    parser.add_argument("--no_jieba", action="store_true", help="禁用 jieba 分词")
+    parser.add_argument("--strip_think", action="store_true", help="离线评测时先剥离 think 块")
+
+    parser.add_argument("--n_samples", type=int, default=10, help="benchmark 样本数，0 表示全量")
+    parser.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL, help="基座模型路径")
+    parser.add_argument("--adapter_path", type=str, default=DEFAULT_ADAPTER_PATH, help="LoRA adapter 路径")
+    parser.add_argument("--merged_model", type=str, default="", help="合并后的 SFT 模型路径")
+    parser.add_argument("--batch_size", type=int, default=1, help="推理 batch 大小")
+    parser.add_argument("--skip_think", action="store_true", help="跳过 Group B")
+    parser.add_argument("--only_groups", type=str, default="", help="仅运行指定组别，如 A,C")
+    return parser
+
+
+def main() -> None:
+    """脚本入口。"""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.mode == "eval":
+        run_eval_mode(args)
+        return
+
+    test_data = load_test_data(Path(args.test))
+    n = args.n_samples if args.n_samples > 0 else len(test_data)
+    test_data = test_data[:n]
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[Benchmark] 使用 {len(test_data)} 条样本，开始在线推理评测...")
+    run_benchmark(
+        base_model_path=args.base_model,
+        adapter_path=args.adapter_path,
+        test_data=test_data,
+        output_dir=output_dir,
+        batch_size=args.batch_size,
+        skip_think=args.skip_think,
+        merged_model_path=args.merged_model if args.merged_model else None,
+        only_groups=args.only_groups if args.only_groups else None,
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,54 @@
+### Model
+model_name_or_path: D:/LLM/models/Qwen3-4B  # 本地路径
+
+### Method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+
+### QLoRA
+quantization_bit: 4
+quantization_method: bitsandbytes
+
+### LoRA 超参（4B 适当降低 rank）
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+
+### Dataset
+dataset: news_structured_summary
+dataset_dir: D:/LLM/LlamaFactory/data
+template: qwen3_nothink
+cutoff_len: 1024
+max_samples: 10000
+overwrite_cache: true
+preprocessing_num_workers: 4
+
+### Qwen3 特有：关闭 thinking 模式（结构化输出任务不需要推理链）
+enable_thinking: false
+
+### Output
+output_dir: projects/edge_news_summarizer/outputs/checkpoints/qwen3-4b-qlora-news-v2
+logging_steps: 10
+save_steps: 50
+save_total_limit: 5
+plot_loss: true
+overwrite_output_dir: true
+
+### Training（batch=1 防止显存溢出到共享内存，accum*16 保持有效 batch=16）
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+fp16: false
+bf16: true            # Qwen3 原生 bfloat16
+ddp_timeout: 180000000
+
+### Validation
+val_size: 0.1
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 50

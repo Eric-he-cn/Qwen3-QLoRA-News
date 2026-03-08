@@ -17,18 +17,18 @@
 用法（微调模型）：
   python scripts/08_demo_cli.py \
     --model_path D:/LLM/models/Qwen3-4B \
-    --adapter_path outputs/checkpoints/qwen3-4b-qlora-news
+        --adapter_path outputs/checkpoints/qwen3-4b-qlora-news-v2
 
 用法（对比模式：基座 vs 微调，交互式）：
   python scripts/08_demo_cli.py \
     --model_path D:/LLM/models/Qwen3-4B \
-    --adapter_path outputs/checkpoints/qwen3-4b-qlora-news \
+        --adapter_path outputs/checkpoints/qwen3-4b-qlora-news-v2 \
     --compare
 
 用法（对比模式：批量处理并保存对比结果）：
   python scripts/08_demo_cli.py \
     --model_path D:/LLM/models/Qwen3-4B \
-    --adapter_path outputs/checkpoints/qwen3-4b-qlora-news \
+        --adapter_path outputs/checkpoints/qwen3-4b-qlora-news-v2 \
     --compare \
     --input_file data/cleaned/test.json \
     --output_file outputs/eval/compare_outputs.jsonl \
@@ -52,6 +52,7 @@ SYSTEM_PROMPT = "你是一位专业的新闻编辑助手，请对新闻进行结
 
 
 def load_prompt_template() -> str:
+    """加载用户提示模板，不存在时使用内置兜底模板。"""
     if PROMPT_TEMPLATE_FILE.exists():
         return PROMPT_TEMPLATE_FILE.read_text(encoding="utf-8")
     return (
@@ -113,7 +114,8 @@ def load_model(model_path: str, adapter_path: str | None = None,
 
 def generate_summary(model, tokenizer, title: str, content: str,
                      prompt_template: str, max_new_tokens: int = 512,
-                     temperature: float = 0.1) -> tuple[str, float]:
+                     temperature: float = 0.1,
+                     enable_thinking: bool = False) -> tuple[str, float]:
     """生成结构化摘要，返回（摘要文本, 耗时秒）。"""
     import torch
 
@@ -128,7 +130,11 @@ def generate_summary(model, tokenizer, title: str, content: str,
 
     try:
         input_ids = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            enable_thinking=enable_thinking,
         )
     except Exception:
         text = f"{SYSTEM_PROMPT}\n\n{user_content}"
@@ -159,6 +165,7 @@ def generate_summary(model, tokenizer, title: str, content: str,
 
 
 def print_result(title: str, output: str, elapsed: float) -> None:
+    """打印单模型推理结果。"""
     print("\n" + "=" * 60)
     print(f"新闻标题：{title[:60]}")
     print("=" * 60)
@@ -169,7 +176,8 @@ def print_result(title: str, output: str, elapsed: float) -> None:
 
 
 def interactive_mode(model, tokenizer, prompt_template: str,
-                     max_new_tokens: int, save_path: Path | None) -> None:
+                     max_new_tokens: int, temperature: float,
+                     enable_thinking: bool, save_path: Path | None) -> None:
     """交互式 CLI 模式。"""
     print("===== 新闻结构化摘要 Demo =====")
     print("输入 'quit' 或 'exit' 退出，输入 'clear' 清屏\n")
@@ -199,7 +207,10 @@ def interactive_mode(model, tokenizer, prompt_template: str,
 
         print("\n[INFO] 正在生成摘要...")
         output, elapsed = generate_summary(
-            model, tokenizer, title, content, prompt_template, max_new_tokens
+            model, tokenizer, title, content, prompt_template,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
         )
         print_result(title, output, elapsed)
 
@@ -216,7 +227,8 @@ def interactive_mode(model, tokenizer, prompt_template: str,
 
 
 def batch_mode(model, tokenizer, prompt_template: str, input_file: Path,
-               output_file: Path, num_samples: int, max_new_tokens: int) -> None:
+               output_file: Path, num_samples: int, max_new_tokens: int,
+               temperature: float, enable_thinking: bool) -> None:
     """批量处理模式。"""
     with open(input_file, encoding="utf-8") as f:
         if input_file.suffix == ".json":
@@ -253,7 +265,10 @@ def batch_mode(model, tokenizer, prompt_template: str, input_file: Path,
 
             print(f"[{i:3d}/{len(data)}] 处理: {title[:50] or '(无标题)'}")
             output, elapsed = generate_summary(
-                model, tokenizer, title, content, prompt_template, max_new_tokens
+                model, tokenizer, title, content, prompt_template,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                enable_thinking=enable_thinking,
             )
 
             result = {
@@ -293,7 +308,8 @@ def compare_batch_mode(base_model, base_tokenizer,
                        ft_model, ft_tokenizer,
                        prompt_template: str, input_file: Path,
                        output_file: Path, num_samples: int,
-                       max_new_tokens: int) -> None:
+                       max_new_tokens: int, temperature: float,
+                       enable_thinking: bool) -> None:
     """对比批量模式：同一输入分别跑基座和微调模型，输出对比结果。"""
     with open(input_file, encoding="utf-8") as f:
         if input_file.suffix == ".json":
@@ -327,10 +343,18 @@ def compare_batch_mode(base_model, base_tokenizer,
 
             base_out, base_t = generate_summary(
                 base_model, base_tokenizer, title, content,
-                prompt_template, max_new_tokens)
+                prompt_template,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                enable_thinking=enable_thinking,
+            )
             ft_out, ft_t = generate_summary(
                 ft_model, ft_tokenizer, title, content,
-                prompt_template, max_new_tokens)
+                prompt_template,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                enable_thinking=enable_thinking,
+            )
 
             print_compare(title, base_out, ft_out, base_t, ft_t)
 
@@ -354,6 +378,8 @@ def compare_interactive_mode(base_model, base_tokenizer,
                               ft_model, ft_tokenizer,
                               prompt_template: str,
                               max_new_tokens: int,
+                              temperature: float,
+                              enable_thinking: bool,
                               save_path: Path | None) -> None:
     """对比交互式模式。"""
     print("===== 新闻摘要对比 Demo（Base vs Fine-tuned）=====")
@@ -377,10 +403,18 @@ def compare_interactive_mode(base_model, base_tokenizer,
 
         print("\n[INFO] 生成基座模型输出...")
         base_out, base_t = generate_summary(
-            base_model, base_tokenizer, title, content, prompt_template, max_new_tokens)
+            base_model, base_tokenizer, title, content, prompt_template,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+        )
         print("[INFO] 生成微调模型输出...")
         ft_out, ft_t = generate_summary(
-            ft_model, ft_tokenizer, title, content, prompt_template, max_new_tokens)
+            ft_model, ft_tokenizer, title, content, prompt_template,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+        )
 
         print_compare(title, base_out, ft_out, base_t, ft_t)
 
@@ -398,6 +432,7 @@ def compare_interactive_mode(base_model, base_tokenizer,
 
 
 def main():
+    """脚本入口。"""
     parser = argparse.ArgumentParser(description="新闻结构化摘要 CLI Demo")
     parser.add_argument("--model_path", type=str, required=True,
                         help="模型路径（对比模式下同时作为基座模型和微调模型的基础）")
@@ -409,6 +444,8 @@ def main():
     parser.add_argument("--quantize", action="store_true", help="使用 4-bit 量化（需要 bitsandbytes）")
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--enable_thinking", action="store_true",
+                        help="启用 thinking 模式（会显著增加时延）")
 
     # 批量模式参数
     parser.add_argument("--input_file", type=str, default=None,
@@ -427,7 +464,7 @@ def main():
     if args.compare:
         if not args.adapter_path:
             print("[ERROR] --compare 模式需要同时提供 --adapter_path", file=sys.stderr)
-            import sys; sys.exit(1)
+            sys.exit(1)
 
         print("[INFO] 对比模式：加载基座模型（无 adapter）...")
         base_model, base_tokenizer = load_model(
@@ -443,17 +480,20 @@ def main():
             input_path = Path(args.input_file)
             if not input_path.exists():
                 print(f"[ERROR] 输入文件不存在: {input_path}", file=sys.stderr)
-                import sys; sys.exit(1)
+                sys.exit(1)
             compare_batch_mode(
                 base_model, base_tokenizer,
                 ft_model, ft_tokenizer,
                 prompt_template, input_path,
-                Path(args.output_file), args.num_samples, args.max_new_tokens)
+                Path(args.output_file), args.num_samples, args.max_new_tokens,
+                args.temperature, args.enable_thinking,
+            )
         else:
             compare_interactive_mode(
                 base_model, base_tokenizer,
                 ft_model, ft_tokenizer,
                 prompt_template, args.max_new_tokens,
+                args.temperature, args.enable_thinking,
                 Path(args.output_file) if args.output_file else None)
         return
 
@@ -465,12 +505,15 @@ def main():
         input_path = Path(args.input_file)
         if not input_path.exists():
             print(f"[ERROR] 输入文件不存在: {input_path}", file=sys.stderr)
-            import sys; sys.exit(1)
+            sys.exit(1)
         batch_mode(model, tokenizer, prompt_template, input_path,
-                   Path(args.output_file), args.num_samples, args.max_new_tokens)
+                   Path(args.output_file), args.num_samples, args.max_new_tokens,
+                   args.temperature, args.enable_thinking)
     else:
         interactive_mode(model, tokenizer, prompt_template,
                          args.max_new_tokens,
+                         args.temperature,
+                         args.enable_thinking,
                          Path(args.output_file) if args.output_file else None)
 
 
