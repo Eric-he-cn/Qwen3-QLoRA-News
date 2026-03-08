@@ -86,11 +86,14 @@ def load_model(model_path: str, adapter_path: str | None = None,
                     "transformers").BitsAndBytesConfig(load_in_4bit=True)
                 load_kwargs["device_map"] = "auto"
             except Exception as e:
-                print(f"[WARN] 4-bit 量化失败: {e}，回退到 float16")
-                load_kwargs["torch_dtype"] = torch.float16
+                print(f"[WARN] 4-bit 量化失败: {e}，回退到 bfloat16")
+                # Qwen3 原生 BF16 训练，使用 bfloat16 而不是 float16
+                # float16 在长序列/大 embedding 下容易引发 NaN
+                load_kwargs["torch_dtype"] = torch.bfloat16
                 load_kwargs["device_map"] = "auto"
         else:
-            load_kwargs["torch_dtype"] = torch.float16
+            # Qwen3 必须使用 bfloat16，不得改为 float16
+            load_kwargs["torch_dtype"] = torch.bfloat16
             load_kwargs["device_map"] = "auto"
     else:
         load_kwargs["torch_dtype"] = __import__("torch").float32

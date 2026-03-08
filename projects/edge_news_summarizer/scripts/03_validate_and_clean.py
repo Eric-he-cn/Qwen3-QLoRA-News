@@ -88,18 +88,23 @@ def check_bullet_points(output_text: str, min_points: int = 3) -> tuple[bool, in
 
 
 def deduplicate(records: list[dict]) -> tuple[list[dict], int]:
-    """按 instruction + input 去重，返回 (唯一记录, 去重数)。"""
-    seen: set[int] = set()
+    """按 instruction + input 去重，返回 (唯一记录, 去重数)。
+
+    注意：原先使用 Python hash() 存在哈希碰撞风险（概率极低但不可忽视）。
+    已改为直接存储字符串键，彻底消除碰撞隐患。
+    """
+    # 使用字符串 set 而非 hash，避免 hash 碰撞导致正常记录被错误删除
+    seen: set[str] = set()
     unique_records: list[dict] = []
     dup_count = 0
 
     for row in records:
-        key = row.get("instruction", "") + row.get("input", "")
-        key_hash = hash(key)
-        if key_hash in seen:
+        # 以 instruction + input 内容为透明 key，不依赖哈希
+        key = row.get("instruction", "") + "\x00" + row.get("input", "")
+        if key in seen:
             dup_count += 1
             continue
-        seen.add(key_hash)
+        seen.add(key)
         unique_records.append(row)
 
     return unique_records, dup_count
@@ -113,11 +118,19 @@ def validate_record(
     min_output_len: int,
     max_output_len: int,
 ) -> tuple[bool, list[str]]:
-    """校验单条记录并返回 (是否通过, 错误列表)。"""
+    """校验单条记录并返回 (是否通过, 错误列表)。
+
+    校验维度：
+    1. 长度约束：input/output 字符数在合理区间内。
+    2. 字段完整性：6 个必需标签全部出现。
+    3. 类别合规性：strict=True 时类别必须命中白名单。
+    4. 要点数量：编号列表至少 3 条。
+    """
     errors: list[str] = []
     input_text = record.get("input", "")
     output_text = record.get("output", "")
 
+    # ── 长度过滤：过短说明内容无效，过长超出训练上下文窗口 ──────────────────
     if len(input_text) < min_input_len:
         errors.append(f"input_too_short({len(input_text)})")
     if len(input_text) > max_input_len:
@@ -127,16 +140,20 @@ def validate_record(
     if len(output_text) > max_output_len:
         errors.append(f"output_too_long({len(output_text)})")
 
+    # ── 字段完整性：6 个标签缺一不可 ────────────────────────────────────────
     sections_ok, missing_sections = check_sections(output_text)
     if not sections_ok:
         errors.append(f"missing_sections:{','.join(missing_sections)}")
 
+    # ── 类别合规性 ───────────────────────────────────────────────────────────
     category = extract_category(output_text)
     if not category:
         errors.append("no_category")
     elif strict and not check_category(category):
+        # 非严格模式下允许白名单外类别（如组合类别"科技/财经"），降低过滤率
         errors.append(f"invalid_category:'{category}'")
 
+    # ── 要点数量：少于 3 条会导致训练样本格式不一致 ──────────────────────────
     bullets_ok, bullet_count = check_bullet_points(output_text)
     if not bullets_ok:
         errors.append(f"insufficient_bullets({bullet_count})")

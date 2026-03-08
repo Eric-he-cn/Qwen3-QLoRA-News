@@ -157,7 +157,13 @@ def check_format(text: str) -> dict:
 
 
 def evaluate_format(predictions: list[str]) -> tuple[dict, list[int]]:
-    """批量评测格式合规率并返回 bad case 索引。"""
+    """批量评测格式合规率并返回 bad case 索引。
+
+    bad case 判定条件（三选一触发即计入）：
+    - 必需字段不完整（any section missing）
+    - 事件类别不在白名单（invalid category）
+    - 核心要点编号条数不足 3 条（valid_bullets=False）
+    """
     rows = [check_format(pred) for pred in predictions]
     n = len(rows)
 
@@ -179,12 +185,19 @@ def evaluate_format(predictions: list[str]) -> tuple[dict, list[int]]:
     report["valid_bullets_rate"] = sum(bool(r["valid_bullets"]) for r in rows) / n
     report["has_time_info_rate"] = sum(bool(r["has_time_info"]) for r in rows) / n
     report["avg_bullet_count"] = sum(int(r["bullet_count"]) for r in rows) / n
+    # 以下两项可由上方字段推导，保留是为了兼容旧报告格式
     report["missing_field_rate"] = 1.0 - report["all_sections_pass_rate"]
     report["invalid_category_rate"] = 1.0 - report["valid_category_rate"]
 
+    # bad case：字段缺失、类别越界、要点不足三条——三者任一触发均计入
+    # 修复前仅检查前两项，导致要点不足的样本被漏统计
     bad_indices = [
         i for i, row in enumerate(rows)
-        if (not bool(row["all_sections_present"])) or (not bool(row["valid_category"]))
+        if (
+            not bool(row["all_sections_present"])
+            or not bool(row["valid_category"])
+            or not bool(row["valid_bullets"])
+        )
     ]
     return report, bad_indices
 
@@ -202,42 +215,59 @@ def _clear_torch_cache() -> None:
 
 
 def _load_tokenizer(model_path: str):
-    """加载 tokenizer，并统一设置左填充与 pad_token。"""
+    """加载 tokenizer，并统一设置左填充与 pad_token。
+
+    注意事项：
+    - padding_side="left"：batch 推理时右侧为有效 token，左填充对 generate 友好。
+    - pad_token_id 缺失时以 eos_token_id 代替，防止生成时报 ValueError。
+    """
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # 批量推理必须左填充：模型 attention 从右往左读有效 token
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
+        # Qwen 系列 tokenizer 通常没有独立 pad_token，以 eos 代替
         tokenizer.pad_token_id = tokenizer.eos_token_id
     return tokenizer
 
 
 def _load_base_model(base_model_path: str):
-    """加载纯基座模型（不注入 LoRA）。"""
+    """加载纯基座模型（不注入 LoRA）。
+
+    设计要点：
+    - 直接使用 AutoModelForCausalLM，不经过 PeftModel 包装。
+    - 这与 Group A 的对比语义一致：测量"纯基座 + 系统提示"的能力上限。
+    - device_map="auto" 让 Accelerate 按显存自动分配层（单卡即全量 GPU）。
+    """
     import torch
     from transformers import AutoModelForCausalLM
 
     print(f"[Benchmark] 加载 Base 模型: {base_model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,   # Qwen3 原生 BF16，不可改为 float16
         device_map="auto",
         trust_remote_code=True,
     )
-    model.eval()
+    model.eval()  # 关闭 dropout 等训练专用层，确保推理确定性
     return model
 
 
 def _load_sft_model(base_model_path: str, adapter_path: str, merged_model_path: str | None):
     """加载 SFT 模型。
 
-    优先策略：
-    - 若提供 merged_model_path：直接加载合并后完整权重。
-    - 否则：加载 base + adapter，并执行 merge_and_unload 后返回纯权重模型。
+    优先策略（按速度/架构干净程度排序）：
+    1. merged_model_path 已提供  → 直接加载合并后完整权重，无额外开销。
+    2. 仅提供 adapter_path       → 加载 base + adapter，调用 merge_and_unload
+                                   使 adapter 权重永久融入 base，返回普通模型。
+
+    说明：不使用 disable_adapter() 方案，避免 PeftModel 包裹对推理路径的干扰。
     """
     import torch
     from transformers import AutoModelForCausalLM
 
+    # ── 路径1：直接加载已合并模型（推荐，速度最快）──────────────────────────
     if merged_model_path:
         print(f"[Benchmark] 加载已合并 SFT 模型: {merged_model_path}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -249,6 +279,7 @@ def _load_sft_model(base_model_path: str, adapter_path: str, merged_model_path: 
         model.eval()
         return model
 
+    # ── 路径2：在线 merge（训练产物未导出时的备选）──────────────────────────
     if not adapter_path:
         raise ValueError("未提供 adapter_path，无法加载未合并 SFT 模型。")
 
@@ -298,20 +329,28 @@ def _infer_group(
         with open(checkpoint_path, encoding="utf-8") as f:
             done = [json.loads(line) for line in f if line.strip()]
         if done:
+            # 将已完成的预测按 index 填回 preds 列表
             for row in done:
                 idx = int(row["index"])
                 if 0 <= idx < n:
                     preds[idx] = row["raw"]
-            start_idx = max(int(row["index"]) for row in done) + 1
-            print(f"  [{group_label}] 检测到 checkpoint，从第 {start_idx} 条继续...", flush=True)
+            print(
+                f"  [{group_label}] 检测到 checkpoint，已恢复 {sum(1 for p in preds if p is not None)} 条，"
+                f"跳过已完成样本继续推理...",
+                flush=True,
+            )
 
-    remaining = list(range(start_idx, n))
+    # 使用 preds 中仍为 None 的索引作为待推理集合
+    # 相比原来 range(start_idx, n) 的方式，此方案能正确处理 checkpoint 中存在空洞的情况
+    # （例如批次中途崩溃导致部分 index 未写入）
+    remaining = [i for i in range(n) if preds[i] is None]
     if not remaining:
         elapsed = 0.0
         print(f"  [{group_label}] checkpoint 已覆盖全部样本，跳过推理。", flush=True)
         return [p if p is not None else "" for p in preds], elapsed
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    # 以追加模式打开 checkpoint 文件，推理后每条立即写盘，防止进程中断导致丢失
     ckpt_f = open(checkpoint_path, "a", encoding="utf-8")
 
     t0 = time.time()
@@ -326,52 +365,62 @@ def _infer_group(
             file=sys.stdout,
         )
 
-    for pos in range(0, len(remaining), batch_size):
-        batch_indices = remaining[pos: pos + batch_size]
+    try:
+        for pos in range(0, len(remaining), batch_size):
+            batch_indices = remaining[pos: pos + batch_size]
 
-        prompts = []
-        for idx in batch_indices:
-            messages = [
-                {"role": "system", "content": MEDIUM_SYSTEM_PROMPT},
-                {"role": "user", "content": samples[idx]["input"]},
-            ]
-            prompts.append(
-                tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
+            # ── 构建本批次的 chat 格式输入 ──────────────────────────────
+            prompts = []
+            for idx in batch_indices:
+                messages = [
+                    {"role": "system", "content": MEDIUM_SYSTEM_PROMPT},
+                    {"role": "user", "content": samples[idx]["input"]},
+                ]
+                prompts.append(
+                    tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
                 )
-            )
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
-        padded_len = inputs["input_ids"].shape[1]
+            # ── tokenize & 移到 GPU ─────────────────────────────────────
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+            # 记录 padding 后的输入长度，解码时只保留新生成的部分
+            padded_len = inputs["input_ids"].shape[1]
 
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.1,
-                repetition_penalty=1.1,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            # ── 无梯度推理，temperature=0.1 保证输出基本稳定 ─────────────
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.1,
+                    repetition_penalty=1.1,  # 轻度抑制重复生成
+                    pad_token_id=tokenizer.pad_token_id,
+                )
 
-        for b_idx, sample_idx in enumerate(batch_indices):
-            new_ids = output_ids[b_idx][padded_len:]
-            pred = tokenizer.decode(new_ids, skip_special_tokens=True)
-            preds[sample_idx] = pred
-            ckpt_f.write(json.dumps({"index": sample_idx, "raw": pred}, ensure_ascii=False) + "\n")
-            ckpt_f.flush()
+            # ── 解码并逐条写入 checkpoint ────────────────────────────────
+            for b_idx, sample_idx in enumerate(batch_indices):
+                # 仅保留新生成 token，去除 prompt 部分
+                new_ids = output_ids[b_idx][padded_len:]
+                pred = tokenizer.decode(new_ids, skip_special_tokens=True)
+                preds[sample_idx] = pred
+                # 每条立即 flush，确保中断后 checkpoint 完整可恢复
+                ckpt_f.write(json.dumps({"index": sample_idx, "raw": pred}, ensure_ascii=False) + "\n")
+                ckpt_f.flush()
 
+            if pbar is not None:
+                pbar.update(len(batch_indices))
+            else:
+                elapsed_now = time.time() - t0
+                print(f"  [{group_label}] {batch_indices[-1] + 1}/{n} 完成  {elapsed_now:.0f}s elapsed", flush=True)
+
+    finally:
+        # 无论是否发生异常，都保证文件句柄正常关闭（防止数据未 flush）
         if pbar is not None:
-            pbar.update(len(batch_indices))
-        else:
-            elapsed_now = time.time() - t0
-            print(f"  [{group_label}] {batch_indices[-1] + 1}/{n} 完成  {elapsed_now:.0f}s elapsed", flush=True)
-
-    if pbar is not None:
-        pbar.close()
-    ckpt_f.close()
+            pbar.close()
+        ckpt_f.close()
 
     elapsed = time.time() - t0
     done_count = max(len(remaining), 1)
@@ -457,16 +506,29 @@ def run_benchmark(
     merged_model_path: str | None = None,
     only_groups: str | None = None,
 ) -> None:
-    """运行 A/B/C 在线推理对比并输出汇总报告。"""
+    """运行 A/B/C 在线推理对比并输出汇总报告。
+
+    组别定义：
+      A = Base 不思考（基线，最快）
+      B = Base 思考（测试 thinking 模式对质量的影响）
+      C = SFT V2 不思考（目标模型）
+
+    设计要点：
+    - 按 model_kind 复用已加载模型，避免 A→B 切换时重复加载（同为 base）。
+    - A→C 切换时主动 del + empty_cache，释放显存后再加载 SFT。
+    - tokenizer 只加载一次；C 单独运行时优先用 merged 路径避免不必要的 base 加载。
+    """
     refs = [row.get("output", "") for row in test_data]
     n = len(test_data)
 
+    # 三组定义：(标签, 模型种类, 是否思考, max_new_tokens, 描述)
     groups = [
         ("A", "base", False, MAX_TOKENS["A"], "Base 不思考"),
-        ("B", "base", True, MAX_TOKENS["B"], "Base 思考"),
-        ("C", "sft", False, MAX_TOKENS["C"], "SFT V2 不思考"),
+        ("B", "base", True,  MAX_TOKENS["B"], "Base 思考"),
+        ("C", "sft",  False, MAX_TOKENS["C"], "SFT V2 不思考"),
     ]
 
+    # ── 按命令行参数过滤运行的组别 ─────────────────────────────────────────
     if skip_think:
         groups = [g for g in groups if g[0] != "B"]
         print("[Benchmark] 已跳过 Group B（Base 思考模式）", flush=True)
@@ -480,15 +542,23 @@ def run_benchmark(
         print("[ERROR] 无有效组别可运行。", file=sys.stderr)
         sys.exit(1)
 
+    # 若 C 需要 SFT 但未提供任何 SFT 路径，提前报错
     need_sft = any(g[1] == "sft" for g in groups)
     if need_sft and not merged_model_path and not adapter_path:
         print("[ERROR] Group C 需要 --merged_model 或 --adapter_path", file=sys.stderr)
         sys.exit(1)
 
-    tokenizer_model_path = merged_model_path if (len(groups) == 1 and groups[0][0] == "C" and merged_model_path) else base_model_path
+    # tokenizer 策略：仅跑 C 且有 merged 模型时，直接用 merged 路径避免加载 base
+    tokenizer_model_path = (
+        merged_model_path
+        if (len(groups) == 1 and groups[0][0] == "C" and merged_model_path)
+        else base_model_path
+    )
     print(f"[Benchmark] 加载 tokenizer: {tokenizer_model_path}")
     tokenizer = _load_tokenizer(tokenizer_model_path)
 
+    # current_kind 记录当前已加载模型的种类（base/sft），
+    # 相同种类连续运行时跳过重新加载（A→B 均为 base，只加载一次）
     current_kind: str | None = None
     current_model = None
     all_summaries: list[dict] = []
@@ -496,10 +566,13 @@ def run_benchmark(
     for label, model_kind, think, max_tok, desc in groups:
         eff_batch = batch_size
         if think and batch_size > 2:
+            # thinking 模式每条输出 token 量远超 no-think，>2 容易 OOM
             print(f"[WARN] Group {label} 为 thinking 模式，建议 batch_size<=2，当前为 {batch_size}")
 
+        # ── 按需切换模型：同 kind 连续跑时复用已加载权重 ──────────────────
         if current_kind != model_kind or current_model is None:
             if current_model is not None:
+                # 主动释放前一个模型的显存，防止同时驻留两个模型导致 OOM
                 del current_model
                 _clear_torch_cache()
             if model_kind == "base":

@@ -107,7 +107,16 @@ def analyze_token_lengths(
     tokenizer_path: str,
     cutoff_len: int,
 ) -> dict:
-    """统计训练数据在 chat template 下的 token 长度分布。"""
+    """统计训练数据在 chat template 下的 token 长度分布。
+
+    用途：
+    - 评估 cutoff_len 是否合理（超长样本会被截断，可能丢失输出字段）。
+    - 指导选择合适的 cutoff_len 权衡覆盖率与显存占用。
+
+    输出字段说明：
+    - over_cutoff / over_cutoff_rate：超出 cutoff 的样本数及比例。
+    - cumulative[N]：token<=N 的样本数及比例，便于快速判断分位点。
+    """
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -122,13 +131,15 @@ def analyze_token_lengths(
         user_input = row.get("input", "")
         output = row.get("output", "")
 
+        # 将 instruction + input 合并为 user 消息（与 LLaMA-Factory 训练格式一致）
         user_content = instruction + ("\n" + user_input if user_input else "")
         messages = [
-            {"role": "system", "content": MEDIUM_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "system",    "content": MEDIUM_SYSTEM_PROMPT},
+            {"role": "user",      "content": user_content},
             {"role": "assistant", "content": output},
         ]
 
+        # apply_chat_template 生成与实际训练完全一致的文本（含特殊 token）
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         lengths.append(len(tokenizer.encode(text)))
 
@@ -138,6 +149,7 @@ def analyze_token_lengths(
     total = len(lengths)
     over_cutoff = sum(1 for l in lengths if l > cutoff_len)
 
+    # 累计分位分布，便于判断各 cutoff 阈值下的覆盖率
     cumulative = {}
     for threshold in [512, 768, 900, 1024, 1280, 1536, 2048]:
         count = sum(1 for l in lengths if l <= threshold)
